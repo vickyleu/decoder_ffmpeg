@@ -16,18 +16,74 @@
 #
 set -eu
 
-FFMPEG_MODULE_PATH="$1"
-echo "FFMPEG_MODULE_PATH is ${FFMPEG_MODULE_PATH}"
-NDK_PATH="$2"
-echo "NDK path is ${NDK_PATH}"
-HOST_PLATFORM="$3"
-echo "Host platform is ${HOST_PLATFORM}"
-ANDROID_ABI="$4"
-echo "ANDROID_ABI is ${ANDROID_ABI}"
-ENABLED_DECODERS=("${@:5}")
-echo "Enabled decoders are ${ENABLED_DECODERS[@]}"
+
+# 用户输入 NDK 路径
+read -p "请输入 NDK 路径 [默认: /path/to/ndk]: " NDK_PATH
+NDK_PATH=${NDK_PATH:-/path/to/ndk}
+echo "NDK 路径是 ${NDK_PATH}"
+
+# 用户输入 Host 平台
+read -p "请输入 Host 平台 [默认: darwin-x86_64]: " HOST_PLATFORM
+HOST_PLATFORM=${HOST_PLATFORM:-darwin-x86_64}
+echo "Host 平台是 ${HOST_PLATFORM}"
+
+# 用户输入 ANDROID_ABI
+read -p "请输入 ANDROID_ABI [默认: 21]: " ANDROID_ABI
+ANDROID_ABI=${ANDROID_ABI:-21}
+echo "ANDROID_ABI 是 ${ANDROID_ABI}"
+
+# 初始化空数组
+USER_INPUT_DECODERS=()
+# 用户输入启用的解码器列表（以空格分隔）
+read -p "请输入启用的解码器（以空格分隔）[默认: vorbis opus flac alac pcm_mulaw pcm_alaw mp3 amrnb amrwb aac ac3 eac3 dca mlp truehd]: " -a ENABLED_DECODERS
+# shellcheck disable=SC2178
+# shellcheck disable=SC2140
+if [ ${#USER_INPUT_DECODERS[@]} -eq 0 ]; then
+    ENABLED_DECODERS=("vorbis" "opus" "flac" "alac" "pcm_mulaw" "pcm_alaw" "mp3" "amrnb" "amrwb" "aac" "ac3" "eac3" "dca" "mlp" "truehd")
+else
+    ENABLED_DECODERS=("${USER_INPUT_DECODERS[@]}")
+fi
+
+echo "启用的解码器是 ${ENABLED_DECODERS[@]}"
+
+# 克隆 ffmpeg 仓库
+git clone git://source.ffmpeg.org/ffmpeg || echo "ffmpeg 已存在 !" && \
+cd ffmpeg && \
+git checkout release/6.0 && \
+echo "ffmpeg 已切换到 release/6.0 分支 !" && \
+FFMPEG_MODULE_PATH="$(pwd)"
+echo "FFMPEG_MODULE_PATH 是 ${FFMPEG_MODULE_PATH}"
+
+# 使用 CPU 核心数进行编译
 JOBS="$(nproc 2> /dev/null || sysctl -n hw.ncpu 2> /dev/null || echo 4)"
-echo "Using $JOBS jobs for make"
+echo "使用 $JOBS 个工作线程进行 make"
+
+
+
+TOOLCHAIN_PREFIX="${NDK_PATH}/toolchains/llvm/prebuilt/${HOST_PLATFORM}/bin"
+if [[ ! -d "${TOOLCHAIN_PREFIX}" ]]; then
+    echo "请设置正确的 NDK_PATH，${NDK_PATH} 不正确"
+    exit 1
+fi
+
+
+
+# 检查 ARMV7 编译器是否存在
+ARMV7_CLANG="${TOOLCHAIN_PREFIX}/armv7a-linux-androideabi${ANDROID_ABI}-clang"
+if [[ ! -e "$ARMV7_CLANG" ]]; then
+    echo "AVMv7 Clang 编译器路径 $ARMV7_CLANG 不存在"
+    echo "可能是你的 NDK 版本不支持 ANDROID_ABI $ANDROID_ABI"
+    echo "请使用旧版本的 NDK 或提高 ANDROID_ABI （注意 ANDROID_ABI 不能大于你的应用的 minSdk）"
+    exit 1
+fi
+
+# 检查 64 位 ANDROID_ABI
+ANDROID_ABI_64BIT="$ANDROID_ABI"
+if [[ "$ANDROID_ABI_64BIT" -lt 21 ]]; then
+    echo "使用 ANDROID_ABI 21 进行 64 位架构编译"
+    ANDROID_ABI_64BIT=21
+fi
+
 COMMON_OPTIONS="
     --target-os=android
     --enable-static
@@ -46,34 +102,12 @@ COMMON_OPTIONS="
     --disable-v4l2-m2m
     --disable-vulkan
     "
-TOOLCHAIN_PREFIX="${NDK_PATH}/toolchains/llvm/prebuilt/${HOST_PLATFORM}/bin"
-if [[ ! -d "${TOOLCHAIN_PREFIX}" ]]
-then
-    echo "Please set correct NDK_PATH, $NDK_PATH is incorrect"
-    exit 1
-fi
-
-for decoder in "${ENABLED_DECODERS[@]}"
-do
+# 添加启用的解码器选项
+for decoder in "${ENABLED_DECODERS[@]}"; do
     COMMON_OPTIONS="${COMMON_OPTIONS} --enable-decoder=${decoder}"
 done
 
-ARMV7_CLANG="${TOOLCHAIN_PREFIX}/armv7a-linux-androideabi${ANDROID_ABI}-clang"
-if [[ ! -e "$ARMV7_CLANG" ]]
-then
-    echo "AVMv7 Clang compiler with path $ARMV7_CLANG does not exist"
-    echo "It's likely your NDK version doesn't support ANDROID_ABI $ANDROID_ABI"
-    echo "Either use older version of NDK or raise ANDROID_ABI (be aware that ANDROID_ABI must not be greater than your application's minSdk)"
-    exit 1
-fi
-ANDROID_ABI_64BIT="$ANDROID_ABI"
-if [[ "$ANDROID_ABI_64BIT" -lt 21 ]]
-then
-    echo "Using ANDROID_ABI 21 for 64-bit architectures"
-    ANDROID_ABI_64BIT=21
-fi
-
-cd "${FFMPEG_MODULE_PATH}/jni/ffmpeg"
+cd "${FFMPEG_MODULE_PATH}"
 ./configure \
     --libdir=android-libs/armeabi-v7a \
     --arch=arm \

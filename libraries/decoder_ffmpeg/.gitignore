@@ -1,0 +1,6 @@
+.cxx
+build
+.idea
+.gradle
+*.iml
+**/build
