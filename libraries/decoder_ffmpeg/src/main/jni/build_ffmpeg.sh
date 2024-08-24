@@ -18,149 +18,315 @@ set -eu
 
 
 # 用户输入 NDK 路径
-read -p "请输入 NDK 路径 [默认: /path/to/ndk]: " NDK_PATH
-NDK_PATH=${NDK_PATH:-/path/to/ndk}
+#read -p "请输入 NDK 路径 [默认: /path/to/ndk]: " NDK_PATH
+#NDK_PATH=${NDK_PATH:-/path/to/ndk}
+NDK_PATH="/Volumes/Extra/Android/sdk/ndk/23.1.7779620"
 echo "NDK 路径是 ${NDK_PATH}"
-
+ANDROID_SDK_HOME="${NDK_PATH}/../../"
 # 用户输入 Host 平台
 read -p "请输入 Host 平台 [默认: darwin-x86_64]: " HOST_PLATFORM
 HOST_PLATFORM=${HOST_PLATFORM:-darwin-x86_64}
 echo "Host 平台是 ${HOST_PLATFORM}"
 
-# 用户输入 ANDROID_ABI
-read -p "请输入 ANDROID_ABI [默认: 21]: " ANDROID_ABI
-ANDROID_ABI=${ANDROID_ABI:-21}
-echo "ANDROID_ABI 是 ${ANDROID_ABI}"
+# 用户输入 ANDROID_PLATFORM
+read -p "请输入 ANDROID_PLATFORM [默认: 21]: " ANDROID_PLATFORM
+ANDROID_PLATFORM=${ANDROID_PLATFORM:-21}
+echo "ANDROID_PLATFORM 是 ${ANDROID_PLATFORM}"
 
 # 初始化空数组
 USER_INPUT_DECODERS=()
 # 用户输入启用的解码器列表（以空格分隔）
-read -p "请输入启用的解码器（以空格分隔）[默认: vorbis opus flac alac pcm_mulaw pcm_alaw mp3 amrnb amrwb aac ac3 eac3 dca mlp truehd]: " -a ENABLED_DECODERS
+read -p "请输入启用的解码器（以空格分隔）[默认: vorbis opus flac alac pcm_mulaw pcm_alaw mp3 amrnb amrwb aac ac3 eac3 dca mlp truehd h264 hevc mpeg2video mpegvideo libvpx_vp8 libvpx_vp9]: " -a ENABLED_DECODERS
 # shellcheck disable=SC2178
 # shellcheck disable=SC2140
 if [ ${#USER_INPUT_DECODERS[@]} -eq 0 ]; then
-    ENABLED_DECODERS=("vorbis" "opus" "flac" "alac" "pcm_mulaw" "pcm_alaw" "mp3" "amrnb" "amrwb" "aac" "ac3" "eac3" "dca" "mlp" "truehd")
+    ENABLED_DECODERS=("vorbis" "opus" "flac" "alac" "pcm_mulaw" "pcm_alaw" "mp3" "amrnb" "amrwb" "aac" "ac3" "eac3" "dca" "mlp" "truehd" "h264" "hevc" "mpeg2video" "mpegvideo" "libvpx_vp8" "libvpx_vp9")
 else
     ENABLED_DECODERS=("${USER_INPUT_DECODERS[@]}")
 fi
 
 echo "启用的解码器是 ${ENABLED_DECODERS[@]}"
 
-# 克隆 ffmpeg 仓库
-git clone git://source.ffmpeg.org/ffmpeg || echo "ffmpeg 已存在 !" && \
-cd ffmpeg && \
-git checkout release/6.0 && \
-echo "ffmpeg 已切换到 release/6.0 分支 !" && \
-FFMPEG_MODULE_PATH="$(pwd)"
-echo "FFMPEG_MODULE_PATH 是 ${FFMPEG_MODULE_PATH}"
-
-# 使用 CPU 核心数进行编译
-JOBS="$(nproc 2> /dev/null || sysctl -n hw.ncpu 2> /dev/null || echo 4)"
-echo "使用 $JOBS 个工作线程进行 make"
+SOURCES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCES_DIR="${SOURCES_DIR}/source"
+echo "SOURCES_DIR 是 ${SOURCES_DIR}"
+BUILD_DIR="${SOURCES_DIR}/build/"
+OUTPUT_DIR="${SOURCES_DIR}/../libs/"
+# Versions
+VPX_VERSION=1.13.0
+MBEDTLS_VERSION=3.4.1
+FFMPEG_VERSION=6.0
 
 
+FFMPEG_DIR=$SOURCES_DIR/ffmpeg-$FFMPEG_VERSION
+VPX_DIR=$SOURCES_DIR/libvpx-$VPX_VERSION
+MBEDTLS_DIR=$SOURCES_DIR/mbedtls-$MBEDTLS_VERSION
 
-TOOLCHAIN_PREFIX="${NDK_PATH}/toolchains/llvm/prebuilt/${HOST_PLATFORM}/bin"
+# Configuration
+ANDROID_ABIS="x86 x86_64 armeabi-v7a arm64-v8a"
+
+
+mkdir -p "${SOURCES_DIR}"
+
+cd "${SOURCES_DIR}" || exit 1
+
+# Build tools
+TOOLCHAIN_PREFIX="${NDK_PATH}/toolchains/llvm/prebuilt/${HOST_PLATFORM}"
 if [[ ! -d "${TOOLCHAIN_PREFIX}" ]]; then
     echo "请设置正确的 NDK_PATH，${NDK_PATH} 不正确"
     exit 1
 fi
+CMAKE_EXECUTABLE=${ANDROID_SDK_HOME}/cmake/3.22.1/bin/cmake
+
+JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || sysctl -n hw.pysicalcpu || echo 4)
 
 
 
-# 检查 ARMV7 编译器是否存在
-ARMV7_CLANG="${TOOLCHAIN_PREFIX}/armv7a-linux-androideabi${ANDROID_ABI}-clang"
-if [[ ! -e "$ARMV7_CLANG" ]]; then
-    echo "AVMv7 Clang 编译器路径 $ARMV7_CLANG 不存在"
-    echo "可能是你的 NDK 版本不支持 ANDROID_ABI $ANDROID_ABI"
-    echo "请使用旧版本的 NDK 或提高 ANDROID_ABI （注意 ANDROID_ABI 不能大于你的应用的 minSdk）"
-    exit 1
-fi
 
-# 检查 64 位 ANDROID_ABI
-ANDROID_ABI_64BIT="$ANDROID_ABI"
-if [[ "$ANDROID_ABI_64BIT" -lt 21 ]]; then
-    echo "使用 ANDROID_ABI 21 进行 64 位架构编译"
-    ANDROID_ABI_64BIT=21
-fi
+function downloadLibVpx() {
+  pushd $SOURCES_DIR
+  echo "Downloading Vpx source code of version $VPX_VERSION..."
+  VPX_FILE=libvpx-$VPX_VERSION.tar.gz
+  curl -L "https://github.com/webmproject/libvpx/archive/refs/tags/v${VPX_VERSION}.tar.gz" -o $VPX_FILE
+  [ -e $VPX_FILE ] || { echo "$VPX_FILE does not exist. Exiting..."; exit 1; }
+  tar -zxf $VPX_FILE
+  rm $VPX_FILE
+  popd
+}
 
-COMMON_OPTIONS="
-    --target-os=android
-    --enable-static
-    --disable-shared
-    --disable-doc
-    --disable-programs
-    --disable-everything
-    --disable-avdevice
-    --disable-avformat
-    --disable-swscale
-    --disable-postproc
-    --disable-avfilter
-    --disable-symver
-    --enable-swresample
-    --extra-ldexeflags=-pie
-    --disable-v4l2-m2m
-    --disable-vulkan
-    "
-# 添加启用的解码器选项
-for decoder in "${ENABLED_DECODERS[@]}"; do
+function downloadMbedTLS() {
+  pushd $SOURCES_DIR
+  echo "Downloading mbedtls source code of version $MBEDTLS_VERSION..."
+  MBEDTLS_FILE=mbedtls-$MBEDTLS_VERSION.tar.gz
+  curl -L "https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v${MBEDTLS_VERSION}.tar.gz" -o $MBEDTLS_FILE
+  [ -e $MBEDTLS_FILE ] || { echo "$MBEDTLS_FILE does not exist. Exiting..."; exit 1; }
+  tar -zxf $MBEDTLS_FILE
+  rm $MBEDTLS_FILE
+  popd
+}
+
+function downloadFfmpeg() {
+  pushd $SOURCES_DIR
+  echo "Downloading FFmpeg source code of version $FFMPEG_VERSION..."
+  FFMPEG_FILE=ffmpeg-$FFMPEG_VERSION.tar.gz
+  curl -L "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.gz" -o $FFMPEG_FILE
+  [ -e $FFMPEG_FILE ] || { echo "$FFMPEG_FILE does not exist. Exiting..."; exit 1; }
+  tar -zxf $FFMPEG_FILE
+  rm $FFMPEG_FILE
+  popd
+}
+
+function buildLibVpx() {
+  pushd $VPX_DIR
+
+  VPX_AS=${TOOLCHAIN_PREFIX}/bin/llvm-as
+  for ABI in $ANDROID_ABIS; do
+    # Set up environment variables
+    case $ABI in
+    armeabi-v7a)
+      EXTRA_BUILD_FLAGS="--force-target=armv7-android-gcc --disable-neon"
+      TOOLCHAIN=armv7a-linux-androideabi21-
+      ;;
+    arm64-v8a)
+      EXTRA_BUILD_FLAGS="--force-target=armv8-android-gcc"
+      TOOLCHAIN=aarch64-linux-android21-
+      ;;
+    x86)
+      EXTRA_BUILD_FLAGS="--force-target=x86-android-gcc --disable-sse2 --disable-sse3 --disable-ssse3 --disable-sse4_1 --disable-avx --disable-avx2 --enable-pic"
+      VPX_AS=${TOOLCHAIN_PREFIX}/bin/yasm
+      TOOLCHAIN=i686-linux-android21-
+      ;;
+    x86_64)
+      EXTRA_BUILD_FLAGS="--force-target=x86_64-android-gcc --disable-sse2 --disable-sse3 --disable-ssse3 --disable-sse4_1 --disable-avx --disable-avx2 --enable-pic --disable-neon --disable-neon-asm"
+      VPX_AS=${TOOLCHAIN_PREFIX}/bin/yasm
+      TOOLCHAIN=x86_64-linux-android21-
+      ;;
+    *)
+      echo "Unsupported architecture: $ABI"
+      exit 1
+      ;;
+    esac
+
+#      --extra-ldflags="-lpthread" \
+      CC=${TOOLCHAIN_PREFIX}/bin/${TOOLCHAIN}clang
+      CXX=${CC}++
+      LD=${CC}
+      AR=${TOOLCHAIN_PREFIX}/bin/llvm-ar \
+      AS=${VPX_AS} \
+      STRIP=${TOOLCHAIN_PREFIX}/bin/llvm-strip \
+      NM=${TOOLCHAIN_PREFIX}/bin/llvm-nm \
+      ./configure \
+      --prefix=$BUILD_DIR/external/$ABI \
+      --libc="${TOOLCHAIN_PREFIX}/sysroot" \
+      --enable-vp8 \
+      --enable-vp9 \
+      --enable-static \
+      --disable-shared \
+      --disable-examples \
+      --disable-docs \
+      --enable-realtime-only \
+      --enable-install-libs \
+      --enable-multithread \
+      --disable-webm-io \
+      --disable-libyuv \
+      --enable-better-hw-compatibility \
+      --disable-runtime-cpu-detect \
+      ${EXTRA_BUILD_FLAGS}
+
+    make clean
+    make -j$JOBS > /dev/null 2>&1 &&\
+    make install
+  done
+  popd
+}
+
+function buildMbedTLS() {
+    pushd $MBEDTLS_DIR
+
+    for ABI in $ANDROID_ABIS; do
+
+      CMAKE_BUILD_DIR=$MBEDTLS_DIR/mbedtls_build_${ABI}
+      rm -rf ${CMAKE_BUILD_DIR}
+      mkdir -p ${CMAKE_BUILD_DIR}
+      cd ${CMAKE_BUILD_DIR}
+
+      ${CMAKE_EXECUTABLE} .. \
+       -DANDROID_PLATFORM=${ANDROID_PLATFORM} \
+       -DANDROID_ABI=$ABI \
+       -DCMAKE_TOOLCHAIN_FILE=${NDK_PATH}/build/cmake/android.toolchain.cmake \
+       -DCMAKE_INSTALL_PREFIX=$BUILD_DIR/external/$ABI \
+       -DENABLE_TESTING=0
+
+      make -j$JOBS > /dev/null 2>&1 &&\
+       make install
+
+    done
+    popd
+}
+
+function buildFfmpeg() {
+  pushd $FFMPEG_DIR
+  EXTRA_BUILD_CONFIGURATION_FLAGS=""
+  COMMON_OPTIONS=""
+  # Add enabled decoders to FFmpeg build configuration
+  for decoder in $ENABLED_DECODERS; do
     COMMON_OPTIONS="${COMMON_OPTIONS} --enable-decoder=${decoder}"
-done
+  done
 
-cd "${FFMPEG_MODULE_PATH}"
-./configure \
-    --libdir=android-libs/armeabi-v7a \
-    --arch=arm \
-    --cpu=armv7-a \
-    --cross-prefix="${TOOLCHAIN_PREFIX}/armv7a-linux-androideabi${ANDROID_ABI}-" \
-    --nm="${TOOLCHAIN_PREFIX}/llvm-nm" \
-    --ar="${TOOLCHAIN_PREFIX}/llvm-ar" \
-    --ranlib="${TOOLCHAIN_PREFIX}/llvm-ranlib" \
-    --strip="${TOOLCHAIN_PREFIX}/llvm-strip" \
-    --extra-cflags="-march=armv7-a -mfloat-abi=softfp" \
-    --extra-ldflags="-Wl,--fix-cortex-a8" \
-    ${COMMON_OPTIONS}
-make -j$JOBS
-make install-libs
-make clean
-./configure \
-    --libdir=android-libs/arm64-v8a \
-    --arch=aarch64 \
-    --cpu=armv8-a \
-    --cross-prefix="${TOOLCHAIN_PREFIX}/aarch64-linux-android${ANDROID_ABI_64BIT}-" \
-    --nm="${TOOLCHAIN_PREFIX}/llvm-nm" \
-    --ar="${TOOLCHAIN_PREFIX}/llvm-ar" \
-    --ranlib="${TOOLCHAIN_PREFIX}/llvm-ranlib" \
-    --strip="${TOOLCHAIN_PREFIX}/llvm-strip" \
-    ${COMMON_OPTIONS}
-make -j$JOBS
-make install-libs
-make clean
-./configure \
-    --libdir=android-libs/x86 \
-    --arch=x86 \
-    --cpu=i686 \
-    --cross-prefix="${TOOLCHAIN_PREFIX}/i686-linux-android${ANDROID_ABI}-" \
-    --nm="${TOOLCHAIN_PREFIX}/llvm-nm" \
-    --ar="${TOOLCHAIN_PREFIX}/llvm-ar" \
-    --ranlib="${TOOLCHAIN_PREFIX}/llvm-ranlib" \
-    --strip="${TOOLCHAIN_PREFIX}/llvm-strip" \
-    --disable-asm \
-    ${COMMON_OPTIONS}
-make -j$JOBS
-make install-libs
-make clean
-./configure \
-    --libdir=android-libs/x86_64 \
-    --arch=x86_64 \
-    --cpu=x86-64 \
-    --cross-prefix="${TOOLCHAIN_PREFIX}/x86_64-linux-android${ANDROID_ABI_64BIT}-" \
-    --nm="${TOOLCHAIN_PREFIX}/llvm-nm" \
-    --ar="${TOOLCHAIN_PREFIX}/llvm-ar" \
-    --ranlib="${TOOLCHAIN_PREFIX}/llvm-ranlib" \
-    --strip="${TOOLCHAIN_PREFIX}/llvm-strip" \
-    --disable-asm \
-    ${COMMON_OPTIONS}
-make -j$JOBS
-make install-libs
-make clean
+  # Build FFmpeg for each architecture and platform
+  for ABI in $ANDROID_ABIS; do
+
+    # Set up environment variables
+    case $ABI in
+    armeabi-v7a)
+      TOOLCHAIN=armv7a-linux-androideabi21-
+      CPU=armv7-a
+      ARCH=arm
+      ;;
+    arm64-v8a)
+      TOOLCHAIN=aarch64-linux-android21-
+      CPU=armv8-a
+      ARCH=aarch64
+      ;;
+    x86)
+      TOOLCHAIN=i686-linux-android21-
+      CPU=i686
+      ARCH=i686
+      EXTRA_BUILD_CONFIGURATION_FLAGS=--disable-asm
+      ;;
+    x86_64)
+      TOOLCHAIN=x86_64-linux-android21-
+      CPU=x86_64
+      ARCH=x86_64
+      ;;
+    *)
+      echo "Unsupported architecture: $ABI"
+      exit 1
+      ;;
+    esac
+
+    # Referencing dependencies without pkgconfig
+    DEP_CFLAGS="-I$BUILD_DIR/external/$ABI/include"
+    DEP_LD_FLAGS="-L$BUILD_DIR/external/$ABI/lib"
+
+    # Configure FFmpeg build
+
+    ./configure \
+      --prefix=$BUILD_DIR/$ABI \
+      --enable-cross-compile \
+      --arch=$ARCH \
+      --cpu=$CPU \
+      --cross-prefix="${TOOLCHAIN_PREFIX}/bin/$TOOLCHAIN" \
+      --nm="${TOOLCHAIN_PREFIX}/bin/llvm-nm" \
+      --ar="${TOOLCHAIN_PREFIX}/bin/llvm-ar" \
+      --ranlib="${TOOLCHAIN_PREFIX}/bin/llvm-ranlib" \
+      --strip="${TOOLCHAIN_PREFIX}/bin/llvm-strip" \
+      --extra-cflags="-O3 -fPIC $DEP_CFLAGS" \
+      --extra-ldflags="$DEP_LD_FLAGS -pthread" \
+      --pkg-config="$(which pkg-config)" \
+      --target-os=android \
+      --enable-shared \
+      --disable-static \
+      --disable-doc \
+      --disable-programs \
+      --disable-everything \
+      --disable-vulkan \
+      --disable-avdevice \
+      --disable-avformat \
+      --disable-postproc \
+      --disable-avfilter \
+      --disable-symver \
+      --enable-parsers \
+      --enable-demuxers \
+      --enable-swresample \
+      --enable-avformat \
+      --enable-libvpx \
+      --enable-protocol=file,http,https,mmsh,mmst,pipe,rtmp,rtmps,rtmpt,rtmpts,rtp,tls \
+      --enable-version3 \
+      --enable-mbedtls \
+      --extra-ldexeflags=-pie \
+      --disable-debug \
+      ${EXTRA_BUILD_CONFIGURATION_FLAGS} \
+      ${COMMON_OPTIONS}
+
+    # Build FFmpeg
+    echo "Building FFmpeg for $ARCH..."
+    make clean
+    make -j$JOBS > /dev/null 2>&1 &&\
+      make install
+
+    OUTPUT_LIB=${OUTPUT_DIR}/lib/${ABI}
+    mkdir -p "${OUTPUT_LIB}"
+    cp "${BUILD_DIR}"/"${ABI}"/lib/*.so "${OUTPUT_LIB}"
+
+    OUTPUT_HEADERS=${OUTPUT_DIR}/include/${ABI}
+    mkdir -p "${OUTPUT_HEADERS}"
+    cp -r "${BUILD_DIR}"/"${ABI}"/include/* "${OUTPUT_HEADERS}"
+
+  done
+  popd
+}
+
+rm -rf $BUILD_DIR
+
+if [[ ! -d "$OUTPUT_DIR" && ! -d "$BUILD_DIR" ]]; then
+  # Download MbedTLS source code if it doesn't exist
+  if [[ ! -d "$MBEDTLS_DIR" ]]; then
+    downloadMbedTLS
+  fi
+
+  # Download Vpx source code if it doesn't exist
+  if [[ ! -d "$VPX_DIR" ]]; then
+    downloadLibVpx
+  fi
+
+  # Download Ffmpeg source code if it doesn't exist
+  if [[ ! -d "$FFMPEG_DIR" ]]; then
+    downloadFfmpeg
+  fi
+
+  # Building library
+  buildMbedTLS
+  buildLibVpx
+  buildFfmpeg
+fi
